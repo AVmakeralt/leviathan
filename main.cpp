@@ -38,12 +38,12 @@ struct State {
   engine_components::search_helpers::CounterMoveTable counter;
   engine_components::search_helpers::PVTable pvTable;
   engine_components::search_helpers::SEE see;
-  engine_components::search_helpers::TacticalSolver tacticalSolver;
-  engine_components::search_helpers::DynamicPVWeights dynamicPv;
   engine_components::search_helpers::SearchResultCache cache;
 
   engine_components::eval_model::Handcrafted handcrafted;
   engine_components::eval_model::EndgameHeuristics endgame;
+  engine_components::eval_model::NNUE nnue;
+  engine_components::eval_model::PolicyNet policy;
   engine_components::eval_model::TrainingInfra training;
 
   engine_components::opening::Book book;
@@ -85,6 +85,8 @@ void initialize(State& state) {
   state.features.multiPV = 1;
   state.parallel.threads = 1;
   state.mcts.enabled = false;
+  state.policy.enabled = true;
+  state.policy.priors = {0.70f, 0.20f, 0.10f};
   state.cache.load(state.openingCachePath);
   state.logFile.open("engine.log", std::ios::app);
   log(state, "engine initialized with search/eval/tooling scaffolding");
@@ -96,13 +98,7 @@ void printUciId() {
   std::cout << "option name Hash type spin default 64 min 1 max 8192\n";
   std::cout << "option name Threads type spin default 1 min 1 max 256\n";
   std::cout << "option name MultiPV type spin default 1 min 1 max 32\n";
-  std::cout << "option name UseAdaptiveMoveOrdering type check default true\n";
-  std::cout << "option name UseAdaptiveLMR type check default true\n";
-  std::cout << "option name UsePhaseAwareFutility type check default true\n";
-  std::cout << "option name UseThreatExtensions type check default true\n";
-  std::cout << "option name UseIID type check default true\n";
-  std::cout << "option name UseLMP type check default true\n";
-  std::cout << "option name UseProbabilisticPruning type check default true\n";
+  std::cout << "option name UseNNUE type check default false\n";
   std::cout << "option name UseMCTS type check default false\n";
   std::cout << "option name UseMultiRateThinking type check default true\n";
   std::cout << "option name AntiCheat type check default false\n";
@@ -135,23 +131,11 @@ void handleSetOption(State& state, const std::string& cmd) {
     state.parallel.threads = std::max(1, std::stoi(value));
   } else if (name == "MultiPV") {
     state.features.multiPV = std::max(1, std::stoi(value));
-  } else if (name == "UseAdaptiveMoveOrdering") {
-    state.features.useAdaptiveMoveOrdering = (value == "true");
-  } else if (name == "UseAdaptiveLMR") {
-    state.features.useAdaptiveLmr = (value == "true");
-  } else if (name == "UsePhaseAwareFutility") {
-    state.features.usePhaseAwareFutility = (value == "true");
-  } else if (name == "UseThreatExtensions") {
-    state.features.useThreatExtensions = (value == "true");
-  } else if (name == "UseIID") {
-    state.features.useIID = (value == "true");
-  } else if (name == "UseLMP") {
-    state.features.useLMP = (value == "true");
-  } else if (name == "UseProbabilisticPruning") {
-    state.features.useProbabilisticPruning = (value == "true");
+  } else if (name == "UseNNUE") {
+    state.nnue.enabled = (value == "true");
   } else if (name == "UseMCTS") {
-    state.features.useMCTS = (value == "true");
-    state.mcts.enabled = state.features.useMCTS;
+    state.mcts.enabled = (value == "true");
+    state.features.useMCTS = state.mcts.enabled;
   } else if (name == "UseMultiRateThinking") {
     state.features.useMultiRateThinking = (value == "true");
   } else if (name == "AntiCheat") {
@@ -245,10 +229,9 @@ void handleGo(State& state, const std::string& cmd) {
   state.stopRequested = false;
   const search::Limits limits = parseGoLimits(state, cmd);
 
-  search::Searcher searcher(state.features, &state.killer, &state.history, &state.counter, &state.pvTable, &state.see, &state.tacticalSolver,
-                            &state.dynamicPv, &state.handcrafted, &state.endgame, &state.tt, &state.stopRequested);
-  searcher.setOpeningKey(key);
-  const search::Result result = searcher.think(state.board, limits);
+  search::Searcher searcher(state.features, &state.killer, &state.history, &state.counter, &state.pvTable, &state.see,
+                            &state.handcrafted, &state.policy);
+  const search::Result result = searcher.think(state.board, limits, state.rng, &state.stopRequested);
 
   bool novel = state.prep.novelty.isNovel(key);
   std::cout << "info depth " << result.depth << " nodes " << result.nodes << " score cp " << result.scoreCp << " pv";
@@ -272,8 +255,6 @@ void handleGo(State& state, const std::string& cmd) {
   std::cout << '\n';
 
   state.cache.put(key, result.bestMove.toUCI());
-  state.prep.dynamicWeights.update(key, novel ? 2 : 1);
-  state.dynamicPv.reward(key + ":" + result.bestMove.toUCI(), 4);
   state.prep.builder.addLine(key, result.bestMove.toUCI());
 }
 
@@ -296,7 +277,7 @@ void runLoop(State& state) {
       state.perftNodes += movegen::generatePseudoLegal(state.board).size();
       std::cout << "info string perft_nodes " << state.perftNodes << '\n';
     } else if (input == "bench") {
-      std::cout << "info string bench placeholders: ordering,lmr,lmp,iid,prob-prune,movegen,tt\n";
+      std::cout << "info string bench placeholders: search, nnue, mcts, movegen, tt\n";
     } else if (input == "buildbook") {
       std::cout << "info string book_lines " << state.prep.builder.lines.size() << '\n';
     } else if (input == "losslearn") {
