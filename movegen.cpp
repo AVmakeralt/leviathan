@@ -28,10 +28,6 @@ static bool sameSide(char a, char b) {
   return std::isupper(static_cast<unsigned char>(a)) == std::isupper(static_cast<unsigned char>(b));
 }
 
-static bool isKing(char c) {
-  return std::tolower(static_cast<unsigned char>(c)) == 'k';
-}
-
 static void pushPawnMove(std::vector<Move>& out, int from, int to, bool promotionRank) {
   if (!promotionRank) {
     out.push_back({from, to, '\0'});
@@ -66,7 +62,7 @@ std::vector<Move> generatePseudoLegal(const board::Board& b) {
         if (nf < 0 || nf > 7) continue;
         int to = one + df;
         if (to < 0 || to >= 64) continue;
-        if (((b.squares[to] != '.' && !sameSide(piece, b.squares[to]) && !isKing(b.squares[to])) || to == b.enPassantSquare)) {
+        if ((b.squares[to] != '.' && !sameSide(piece, b.squares[to])) || to == b.enPassantSquare) {
           pushPawnMove(moves, from, to, (white && to / 8 == 7) || (!white && to / 8 == 0));
         }
       }
@@ -79,7 +75,7 @@ std::vector<Move> generatePseudoLegal(const board::Board& b) {
         int nf = f + k[0], nr = r + k[1];
         if (nf < 0 || nf > 7 || nr < 0 || nr > 7) continue;
         int to = nr * 8 + nf;
-        if (!sameSide(piece, b.squares[to]) && !isKing(b.squares[to])) moves.push_back({from, to, '\0'});
+        if (!sameSide(piece, b.squares[to])) moves.push_back({from, to, '\0'});
       }
       continue;
     }
@@ -90,11 +86,9 @@ std::vector<Move> generatePseudoLegal(const board::Board& b) {
         while (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) {
           int to = nr * 8 + nf;
           if (sameSide(piece, b.squares[to])) break;
-          if (isKing(b.squares[to])) break;
           moves.push_back({from, to, '\0'});
           if (b.squares[to] != '.' || single) break;
-          nf += dirs[i][0];
-          nr += dirs[i][1];
+          nf += dirs[i][0]; nr += dirs[i][1];
         }
       }
     };
@@ -105,25 +99,19 @@ std::vector<Move> generatePseudoLegal(const board::Board& b) {
 
     if (p == 'b') slide(bdirs, 4, false);
     else if (p == 'r') slide(rdirs, 4, false);
-    else if (p == 'q') {
-      slide(bdirs, 4, false);
-      slide(rdirs, 4, false);
-    } else if (p == 'k') {
+    else if (p == 'q') { slide(bdirs, 4, false); slide(rdirs, 4, false); }
+    else if (p == 'k') {
       slide(kdirs, 8, true);
-      if (white && from == 4 && piece == 'K') {
-        if ((b.castlingRights & 1) && b.squares[7] == 'R' && b.squares[5] == '.' && b.squares[6] == '.' &&
-            !b.isSquareAttacked(4, false) && !b.isSquareAttacked(5, false) && !b.isSquareAttacked(6, false))
-          moves.push_back({4, 6, '\0'});
-        if ((b.castlingRights & 2) && b.squares[0] == 'R' && b.squares[3] == '.' && b.squares[2] == '.' && b.squares[1] == '.' &&
-            !b.isSquareAttacked(4, false) && !b.isSquareAttacked(3, false) && !b.isSquareAttacked(2, false))
-          moves.push_back({4, 2, '\0'});
-      } else if (!white && from == 60 && piece == 'k') {
-        if ((b.castlingRights & 4) && b.squares[63] == 'r' && b.squares[61] == '.' && b.squares[62] == '.' &&
-            !b.isSquareAttacked(60, true) && !b.isSquareAttacked(61, true) && !b.isSquareAttacked(62, true))
-          moves.push_back({60, 62, '\0'});
-        if ((b.castlingRights & 8) && b.squares[56] == 'r' && b.squares[59] == '.' && b.squares[58] == '.' && b.squares[57] == '.' &&
-            !b.isSquareAttacked(60, true) && !b.isSquareAttacked(59, true) && !b.isSquareAttacked(58, true))
-          moves.push_back({60, 58, '\0'});
+      if (white) {
+        if ((b.castlingRights & 1) && b.squares[5] == '.' && b.squares[6] == '.' &&
+            !b.isSquareAttacked(4, false) && !b.isSquareAttacked(5, false) && !b.isSquareAttacked(6, false)) moves.push_back({4, 6, '\0'});
+        if ((b.castlingRights & 2) && b.squares[3] == '.' && b.squares[2] == '.' && b.squares[1] == '.' &&
+            !b.isSquareAttacked(4, false) && !b.isSquareAttacked(3, false) && !b.isSquareAttacked(2, false)) moves.push_back({4, 2, '\0'});
+      } else {
+        if ((b.castlingRights & 4) && b.squares[61] == '.' && b.squares[62] == '.' &&
+            !b.isSquareAttacked(60, true) && !b.isSquareAttacked(61, true) && !b.isSquareAttacked(62, true)) moves.push_back({60, 62, '\0'});
+        if ((b.castlingRights & 8) && b.squares[59] == '.' && b.squares[58] == '.' && b.squares[57] == '.' &&
+            !b.isSquareAttacked(60, true) && !b.isSquareAttacked(59, true) && !b.isSquareAttacked(58, true)) moves.push_back({60, 58, '\0'});
       }
     }
   }
@@ -146,8 +134,7 @@ std::vector<Move> generateLegal(const board::Board& b) {
 
 bool isLegalMove(const board::Board& b, const Move& m) {
   auto legal = generateLegal(b);
-  for (const auto& x : legal)
-    if (x == m) return true;
+  for (const auto& x : legal) if (x == m) return true;
   return false;
 }
 

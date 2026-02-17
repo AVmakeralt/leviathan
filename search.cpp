@@ -9,145 +9,67 @@ namespace search {
 namespace {
 constexpr int INF = 1000000;
 constexpr int MATE = 900000;
-constexpr int MAX_PLY = 120;
-
-int pieceValue(char c) {
-  switch (std::tolower(static_cast<unsigned char>(c))) {
-    case 'p': return 100;
-    case 'n': return 320;
-    case 'b': return 330;
-    case 'r': return 500;
-    case 'q': return 900;
-    default: return 0;
-  }
-}
-
-bool isCapture(const board::Board& b, const movegen::Move& m) {
-  char moved = b.squares[m.from];
-  char dst = b.squares[m.to];
-  if (dst != '.') return true;
-  return std::tolower(static_cast<unsigned char>(moved)) == 'p' && m.to == b.enPassantSquare;
-}
-
-bool isQuiet(const board::Board& b, const movegen::Move& m) {
-  return !isCapture(b, m) && !m.promotion;
-}
-
 int see(const board::Board& b, const movegen::Move& m) {
-  return pieceValue(b.squares[m.to]) - pieceValue(b.squares[m.from]);
+  auto val = [](char c) {
+    switch (std::tolower(static_cast<unsigned char>(c))) {
+      case 'p': return 100; case 'n': return 320; case 'b': return 330; case 'r': return 500; case 'q': return 900; default: return 0;
+    }
+  };
+  return val(b.squares[m.to]) - val(b.squares[m.from]);
 }
-
-}  // namespace
+}
 
 Searcher::Searcher(const eval::Params& params, tt::Table* table, bool* stop)
     : params_(params), tt_(table), stop_(stop) {}
 
-int Searcher::historyScore(const movegen::Move& m) const {
-  if (m.from < 0 || m.to < 0) return 0;
-  return history_[m.from][m.to];
-}
-
-std::vector<movegen::Move> Searcher::orderMoves(board::Board& b, const std::vector<movegen::Move>& moves, const movegen::Move& ttMove,
-                                                int ply, movegen::Move prevMove) {
+std::vector<movegen::Move> Searcher::order(board::Board& b, const std::vector<movegen::Move>& moves, const movegen::Move& ttMove) {
   std::vector<std::pair<int, movegen::Move>> scored;
   scored.reserve(moves.size());
   for (const auto& m : moves) {
     int score = 0;
-    if (m == ttMove) score += 2'000'000;
-    if (m == killers_[ply][0]) score += 900'000;
-    else if (m == killers_[ply][1]) score += 850'000;
-    if (prevMove.from >= 0 && counterMoves_[prevMove.from][prevMove.to] == m) score += 800'000;
-
-    if (isCapture(b, m)) {
-      score += 1'000'000 + see(b, m);
-    } else {
-      score += historyScore(m);
-    }
-
+    if (m == ttMove) score += 1000000;
+    if (b.squares[m.to] != '.') score += 500000 + see(b, m);
+    if (m.promotion) score += 400000;
     board::Undo u;
     if (b.makeMove(m.from, m.to, m.promotion, u)) {
-      if (b.inCheck(b.whiteToMove)) score += 300'000;
+      if (b.inCheck(b.whiteToMove)) score += 200000;
       b.unmakeMove(m.from, m.to, m.promotion, u);
     }
     scored.push_back({score, m});
   }
   std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-
   std::vector<movegen::Move> out;
-  out.reserve(scored.size());
   for (auto& x : scored) out.push_back(x.second);
   return out;
 }
 
-void Searcher::updateHeuristics(const movegen::Move& best, const std::vector<movegen::Move>& tried, int ply, int depth,
-                                movegen::Move prevMove) {
-  if (best.from < 0) return;
-  history_[best.from][best.to] += depth * depth;
-  history_[best.from][best.to] = std::clamp(history_[best.from][best.to], -50000, 50000);
-
-  if (best.from >= 0 && best.to >= 0) {
-    if (killers_[ply][0] == best) {
-    } else {
-      killers_[ply][1] = killers_[ply][0];
-      killers_[ply][0] = best;
-    }
-  }
-
-  if (prevMove.from >= 0 && prevMove.to >= 0) counterMoves_[prevMove.from][prevMove.to] = best;
-
-  for (const auto& m : tried) {
-    if (m == best) continue;
-    if (m.from >= 0 && m.to >= 0) { history_[m.from][m.to] -= depth; history_[m.from][m.to] = std::clamp(history_[m.from][m.to], -50000, 50000); }
-  }
-}
-
 int Searcher::quiescence(board::Board& b, int alpha, int beta, int ply) {
+  (void)ply;
   ++nodes_;
-  if (softNodeStop_ && nodes_ >= softNodeStop_) *stop_ = true;
-  if (*stop_) return 0;
-
   int stand = eval::evaluate(b, params_);
   if (stand >= beta) return beta;
   alpha = std::max(alpha, stand);
 
-  auto pseudo = movegen::generatePseudoLegal(b);
-  for (const auto& m : pseudo) {
-    if (!isCapture(b, m) && !m.promotion) continue;
-    if (see(b, m) < -200) continue;
-
+  auto moves = movegen::generatePseudoLegal(b);
+  for (const auto& m : moves) {
+    if (b.squares[m.to] == '.' && !m.promotion) continue;
+    if (see(b, m) < -120) continue;
     board::Undo u;
     if (!b.makeMove(m.from, m.to, m.promotion, u)) continue;
     int score = -quiescence(b, -beta, -alpha, ply + 1);
     b.unmakeMove(m.from, m.to, m.promotion, u);
-
     if (score >= beta) return beta;
     alpha = std::max(alpha, score);
   }
   return alpha;
 }
 
-int Searcher::alphaBeta(board::Board& b, int depth, int alpha, int beta, int ply, bool allowNull, movegen::Move prevMove) {
-  if (ply >= MAX_PLY) return eval::evaluate(b, params_);
-  if (softNodeStop_ && nodes_ >= softNodeStop_) *stop_ = true;
+int Searcher::alphaBeta(board::Board& b, int depth, int alpha, int beta, int ply, bool allowNull) {
   if (*stop_) return 0;
-
-  if (b.halfmoveClock >= 100) return 0;
-  std::uint64_t currentKey = tt::hash(b);
-  auto itRep = repetition_.find(currentKey);
-  if (itRep != repetition_.end() && itRep->second >= 3) return 0;
-
-  bool inCheck = b.inCheck(b.whiteToMove);
   if (depth <= 0) return quiescence(b, alpha, beta, ply);
-
   ++nodes_;
-  int origAlpha = alpha;
-  int origBeta = beta;
 
-  alpha = std::max(alpha, -MATE + ply);
-  beta = std::min(beta, MATE - ply - 1);
-  if (alpha >= beta) return alpha;
-
-  std::uint64_t key = currentKey;
+  std::uint64_t key = tt::hash(b);
   tt::Entry tte;
   movegen::Move ttMove{};
   if (tt_ && tt_->probe(key, tte)) {
@@ -159,162 +81,91 @@ int Searcher::alphaBeta(board::Board& b, int depth, int alpha, int beta, int ply
     }
   }
 
-  int staticEval = eval::evaluate(b, params_);
-  if (!inCheck && depth <= 3) {
-    if (staticEval - 120 * depth >= beta) return staticEval;
-  }
-
-  if (allowNull && !inCheck && depth >= 3) {
+  if (allowNull && depth >= 3 && !b.inCheck(b.whiteToMove)) {
     b.whiteToMove = !b.whiteToMove;
-    int R = 2 + depth / 6;
-    int score = -alphaBeta(b, depth - 1 - R, -beta, -beta + 1, ply + 1, false, movegen::Move{});
+    int score = -alphaBeta(b, depth - 1 - 2, -beta, -beta + 1, ply + 1, false);
     b.whiteToMove = !b.whiteToMove;
     if (score >= beta) return beta;
   }
 
   auto legal = movegen::generateLegal(b);
-  if (legal.empty()) return inCheck ? -MATE + ply : 0;
+  if (legal.empty()) return b.inCheck(b.whiteToMove) ? -MATE + ply : 0;
 
-  if (ttMove.from < 0 && depth >= 6) {
-    (void)alphaBeta(b, depth - 2, alpha, beta, ply, false, prevMove);
-    tt::Entry iid;
-    if (tt_ && tt_->probe(key, iid)) ttMove = iid.bestMove;
-  }
-
-  auto moves = orderMoves(b, legal, ttMove, std::min(ply, 127), prevMove);
-
-  int bestScore = -INF;
+  auto ordered = order(b, legal, ttMove);
+  int best = -INF;
+  int origAlpha = alpha;
   movegen::Move bestMove{};
-  std::vector<movegen::Move> tried;
-  tried.reserve(moves.size());
 
-  bool pvNode = (beta - alpha > 1);
-  for (size_t i = 0; i < moves.size(); ++i) {
-    const auto& m = moves[i];
-    bool quiet = isQuiet(b, m);
-    bool capture = isCapture(b, m);
-
-    if (depth <= 4 && i >= static_cast<size_t>(6 + depth * 2) && !inCheck && quiet) {
-      continue;
-    }
-
-    if (!inCheck && depth <= 3 && quiet && staticEval + 80 * depth <= alpha) {
-      continue;
-    }
-
+  for (size_t i = 0; i < ordered.size(); ++i) {
+    const auto& m = ordered[i];
     board::Undo u;
     if (!b.makeMove(m.from, m.to, m.promotion, u)) continue;
 
-    std::uint64_t childKey = tt::hash(b);
-    ++repetition_[childKey];
-
     int ext = b.inCheck(b.whiteToMove) ? 1 : 0;
-    int lmr = 0;
-    if (depth >= 3 && i >= 3 && !inCheck && quiet) {
-      lmr = 1 + (depth >= 6 && i >= 8 ? 1 : 0);
-      if (capture) lmr = std::max(0, lmr - 1);
-    }
-
-    int newDepth = std::max(0, depth - 1 + ext - lmr);
+    int newDepth = depth - 1 + ext;
+    int reduction = (depth >= 3 && i >= 4 && b.squares[m.to] == '.' && !m.promotion) ? 1 : 0;
 
     int score;
-    if (i == 0) {
-      score = -alphaBeta(b, newDepth, -beta, -alpha, ply + 1, true, m);
-    } else {
-      score = -alphaBeta(b, newDepth, -alpha - 1, -alpha, ply + 1, true, m);
-      if (score > alpha && (pvNode || score < beta)) {
-        score = -alphaBeta(b, depth - 1 + ext, -beta, -alpha, ply + 1, true, m);
-      }
+    if (i == 0) score = -alphaBeta(b, newDepth, -beta, -alpha, ply + 1, true);
+    else {
+      score = -alphaBeta(b, newDepth - reduction, -alpha - 1, -alpha, ply + 1, true);
+      if (score > alpha && score < beta) score = -alphaBeta(b, newDepth, -beta, -alpha, ply + 1, true);
     }
-
     b.unmakeMove(m.from, m.to, m.promotion, u);
-    auto itChild = repetition_.find(childKey);
-    if (itChild != repetition_.end()) {
-      if (--itChild->second == 0) repetition_.erase(itChild);
-    }
-    tried.push_back(m);
 
-    if (score > bestScore) {
-      bestScore = score;
+    if (score > best) {
+      best = score;
       bestMove = m;
       if (ply == 0) rootBest_ = m;
     }
     alpha = std::max(alpha, score);
-
-    if (alpha >= beta) {
-      updateHeuristics(bestMove, tried, std::min(ply, 127), depth, prevMove);
-      break;
-    }
+    if (alpha >= beta) break;
   }
 
   if (tt_) {
     tt::Entry e;
     e.key = key;
     e.depth = depth;
-    e.score = bestScore;
+    e.score = best;
     e.bestMove = bestMove;
-    if (bestScore <= origAlpha) e.bound = tt::UPPER;
-    else if (bestScore >= origBeta) e.bound = tt::LOWER;
-    else e.bound = tt::EXACT;
+    e.bound = (best <= origAlpha) ? tt::UPPER : (best >= beta ? tt::LOWER : tt::EXACT);
     tt_->store(e);
   }
-
-  return bestScore;
+  return best;
 }
 
 Result Searcher::think(board::Board& b, const Limits& l) {
   Result r;
   nodes_ = 0;
   rootBest_ = {};
-  rootPonder_ = {};
-  *stop_ = false;
-  repetition_.clear();
-  repetition_[tt::hash(b)] = 1;
-
-  if (l.movetimeMs > 0) softNodeStop_ = static_cast<std::uint64_t>(std::max(10000, l.movetimeMs * 2000));
-  else softNodeStop_ = 0;
-
   int score = 0;
+  int alpha = -INF;
+  int beta = INF;
   auto start = std::chrono::steady_clock::now();
 
-  for (int depth = 1; depth <= std::max(1, l.depth) && !*stop_; ++depth) {
-    int delta = 18 + depth * 8;
-    int alpha = std::max(-INF, score - delta);
-    int beta = std::min(INF, score + delta);
-
-    while (!*stop_) {
-      score = alphaBeta(b, depth, alpha, beta, 0, true, movegen::Move{});
+  for (int d = 1; d <= l.depth && !*stop_; ++d) {
+    int window = 20 + d * 10;
+    alpha = score - window;
+    beta = score + window;
+    while (true) {
+      score = alphaBeta(b, d, alpha, beta, 0, true);
       if (score <= alpha) {
-        alpha = std::max(-INF, alpha - delta);
-        delta *= 2;
+        alpha -= window;
+        window *= 2;
       } else if (score >= beta) {
-        beta = std::min(INF, beta + delta);
-        delta *= 2;
-      } else {
-        break;
-      }
+        beta += window;
+        window *= 2;
+      } else break;
     }
-
-    r.depth = depth;
+    r.depth = d;
     r.bestMove = rootBest_;
     r.scoreCp = score;
-    r.nodes = nodes_;
-
-    if (r.bestMove.from >= 0) {
-      board::Undo u;
-      if (b.makeMove(r.bestMove.from, r.bestMove.to, r.bestMove.promotion, u)) {
-        auto pm = movegen::generateLegal(b);
-        if (!pm.empty()) rootPonder_ = pm.front();
-        b.unmakeMove(r.bestMove.from, r.bestMove.to, r.bestMove.promotion, u);
-      }
-    }
-
     auto now = std::chrono::steady_clock::now();
     int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
     if (!l.infinite && l.movetimeMs > 0 && elapsed >= l.movetimeMs) break;
   }
 
-  r.ponder = rootPonder_;
+  r.nodes = nodes_;
   r.pv = {r.bestMove};
   r.evalBreakdown = eval::breakdown(b, params_);
   r.candidateDepths = {r.depth};
