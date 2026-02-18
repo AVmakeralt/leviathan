@@ -43,6 +43,7 @@ struct State {
   engine_components::eval_model::Handcrafted handcrafted;
   engine_components::eval_model::EndgameHeuristics endgame;
   engine_components::eval_model::NNUE nnue;
+  engine_components::eval_model::StrategyNet strategyNet;
   engine_components::eval_model::PolicyNet policy;
   engine_components::eval_model::TrainingInfra training;
 
@@ -86,10 +87,14 @@ void initialize(State& state) {
   state.parallel.threads = 1;
   state.mcts.enabled = false;
   state.policy.enabled = true;
+  state.nnue.load("nnue.bin");
+  state.strategyNet.load("strategy_large.nn");
   state.policy.priors = {0.70f, 0.20f, 0.10f};
   state.cache.load(state.openingCachePath);
   state.logFile.open("engine.log", std::ios::app);
   log(state, "engine initialized with search/eval/tooling scaffolding");
+  log(state, "nnue_params=" + std::to_string(state.nnue.parameterCount()) +
+            " strategy_params=" + std::to_string(state.strategyNet.parameterCount()));
 }
 
 void printUciId() {
@@ -98,8 +103,10 @@ void printUciId() {
   std::cout << "option name Hash type spin default 64 min 1 max 8192\n";
   std::cout << "option name Threads type spin default 1 min 1 max 256\n";
   std::cout << "option name MultiPV type spin default 1 min 1 max 32\n";
-  std::cout << "option name UseNNUE type check default false\n";
+  std::cout << "option name UseNNUE type check default true\n";
   std::cout << "option name UseMCTS type check default false\n";
+  std::cout << "option name UseStrategyNN type check default true\n";
+  std::cout << "option name StrategyPolicyOutputs type spin default 64 min 16 max 4096\n";
   std::cout << "option name UseMultiRateThinking type check default true\n";
   std::cout << "option name AntiCheat type check default false\n";
   std::cout << "uciok\n";
@@ -136,6 +143,11 @@ void handleSetOption(State& state, const std::string& cmd) {
   } else if (name == "UseMCTS") {
     state.mcts.enabled = (value == "true");
     state.features.useMCTS = state.mcts.enabled;
+  } else if (name == "UseStrategyNN") {
+    state.strategyNet.enabled = (value == "true");
+  } else if (name == "StrategyPolicyOutputs") {
+    state.strategyNet.cfg.policyOutputs = std::max(16, std::stoi(value));
+    state.strategyNet.load(state.strategyNet.weightsPath);
   } else if (name == "UseMultiRateThinking") {
     state.features.useMultiRateThinking = (value == "true");
   } else if (name == "AntiCheat") {
@@ -230,7 +242,7 @@ void handleGo(State& state, const std::string& cmd) {
   const search::Limits limits = parseGoLimits(state, cmd);
 
   search::Searcher searcher(state.features, &state.killer, &state.history, &state.counter, &state.pvTable, &state.see,
-                            &state.handcrafted, &state.policy);
+                            &state.handcrafted, &state.policy, &state.nnue, &state.strategyNet);
   const search::Result result = searcher.think(state.board, limits, state.rng, &state.stopRequested);
 
   bool novel = state.prep.novelty.isNovel(key);
