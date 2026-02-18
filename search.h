@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <future>
 #include <cctype>
 #include <random>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -59,6 +62,16 @@ class Searcher {
     Result out;
     boardSnapshot_ = b;
     const auto moves = movegen::generatePseudoLegal(b);
+    nodeCounter_ = 0;
+    strategyCadence_ = std::max(4, limits.depth * 2);
+    strategyCached_ = false;
+    std::uint64_t occ = 0ULL;
+    for (int sq = 0; sq < 64; ++sq) if (boardSnapshot_.squares[static_cast<std::size_t>(sq)] != '.') occ |= (1ULL << sq);
+    temporal_.push(occ);
+    if (nnue_ && nnue_->enabled) {
+      const auto nnueFeatures = engine_components::eval_model::NNUE::extractFeatures(boardSnapshot_.squares, boardSnapshot_.whiteToMove, nnue_->cfg.inputs);
+      nnue_->initializeAccumulator(nnueAccumulator_, nnueFeatures);
+    }
     out.nodes = static_cast<long long>(moves.size()) * 128;
     out.depth = std::max(1, limits.depth);
     if (moves.empty()) {
@@ -97,6 +110,12 @@ class Searcher {
   const engine_components::eval_model::NNUE* nnue_;
   const engine_components::eval_model::StrategyNet* strategyNet_;
   board::Board boardSnapshot_{};
+  std::size_t nodeCounter_ = 0;
+  int strategyCadence_ = 8;
+  mutable engine_components::eval_model::StrategyOutput cachedStrategy_{};
+  mutable bool strategyCached_ = false;
+  mutable engine_components::eval_model::NNUE::Accumulator nnueAccumulator_{};
+  engine_components::representation::TemporalBitboard temporal_{};
 
   void assignCandidateDepths(Result& out, int candidateCount, int rootDepth) const {
     out.candidateDepths.assign(candidateCount, rootDepth);
@@ -126,12 +145,57 @@ class Searcher {
       }
 
       int score = alphaBeta(depth, alpha, beta);
+      if (strategyNet_ && strategyNet_->enabled) strategyCached_ = false;
       if (features_.useAspiration) {
         alpha = score - 50;
         beta = score + 50;
       }
       out.scoreCp = score;
-      out.bestMove = moves[d(rng)];
+      std::vector<std::pair<int, movegen::Move>> ordered;
+      ordered.reserve(moves.size());
+      for (const auto& m : moves) {
+        ordered.push_back({moveOrderingBias(m, depth), m});
+      }
+      std::sort(ordered.begin(), ordered.end(), [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+      if (features_.usePolicyPruning) {
+        int keep = std::max(1, std::min(features_.policyTopK, static_cast<int>(ordered.size())));
+        if (strategyNet_ && strategyNet_->enabled) {
+          const auto& sOut = getStrategyOutput(false);
+          if (!sOut.policy.empty()) {
+            const float maxLogit = *std::max_element(sOut.policy.begin(), sOut.policy.end());
+            float sumExp = 0.0f;
+            for (float logit : sOut.policy) sumExp += std::exp(logit - maxLogit);
+            const float topProb = 1.0f / std::max(1e-6f, sumExp);
+            if (topProb >= features_.policyPruneThreshold) keep = 1;
+          }
+        }
+        ordered.resize(static_cast<std::size_t>(keep));
+      }
+
+
+      std::vector<std::future<int>> scouts;
+      const int scoutCount = std::min(7, static_cast<int>(ordered.size()));
+      for (int i = 0; i < scoutCount; ++i) {
+        const movegen::Move scoutMove = ordered[static_cast<std::size_t>(i)].second;
+        scouts.push_back(std::async(std::launch::async, [this, scoutMove, depth]() {
+          return evaluateMoveLazy(scoutMove, depth + 1, true);
+        }));
+      }
+
+      int bestScore = -300000;
+      out.bestMove = ordered.empty() ? moves[d(rng)] : ordered.front().second;
+      const int masterCount = std::max(1, std::min(features_.masterEvalTopMoves, static_cast<int>(ordered.size())));
+      for (std::size_t i = 0; i < ordered.size(); ++i) {
+        const bool useMaster = !features_.useLazyEval || static_cast<int>(i) < masterCount;
+        int candidate = evaluateMoveLazy(ordered[i].second, depth, useMaster);
+        if (i < scouts.size()) {
+          candidate = std::max(candidate, scouts[i].get());
+        }
+        if (candidate > bestScore) {
+          bestScore = candidate;
+          out.bestMove = ordered[i].second;
+        }
+      }
       out.nodes += depth * 1000;
 
       updateHeuristics(depth, out.bestMove);
@@ -147,6 +211,7 @@ class Searcher {
       return features_.useQuiescence ? quiescence(alpha, beta) : 0;
     }
 
+    ++nodeCounter_;
     int score = 20 * depth;
     if (features_.usePVS) score += 2;
     if (features_.useNullMove) score += 1;
@@ -156,21 +221,22 @@ class Searcher {
     if (features_.useExtensions) score += 1;
     if (handcrafted_) score += handcrafted_->score() / 100;
     if (nnue_ && nnue_->enabled) {
-      const std::vector<float> features = engine_components::eval_model::NNUE::extractFeatures(
+      const std::vector<float> nnueFeatures = engine_components::eval_model::NNUE::extractFeatures(
           boardSnapshot_.squares, boardSnapshot_.whiteToMove, nnue_->cfg.inputs);
-      score += nnue_->evaluate(features) / 16;
+      score += nnue_->evaluate(nnueFeatures) / 16;
     }
-    if (strategyNet_ && strategyNet_->enabled) {
-      std::vector<float> planes(static_cast<std::size_t>(strategyNet_->cfg.planes), 0.0f);
-      for (int sq = 0; sq < 64; ++sq) {
-        char piece = boardSnapshot_.squares[static_cast<std::size_t>(sq)];
-        if (piece != '.') {
-          int idx = std::min(strategyNet_->cfg.planes - 1, std::tolower(static_cast<unsigned char>(piece)) - 'a');
-          if (idx >= 0 && idx < strategyNet_->cfg.planes) planes[static_cast<std::size_t>(idx)] += 1.0f / 8.0f;
-        }
-      }
-      const engine_components::eval_model::StrategyOutput out = strategyNet_->evaluate(planes);
+
+    const bool runStrategyNow = strategyNet_ && strategyNet_->enabled &&
+                                (depth >= std::max(1, strategyCadence_ / 4) || nodeCounter_ % static_cast<std::size_t>(strategyCadence_) == 0);
+    if (runStrategyNow) {
+      const engine_components::eval_model::StrategyOutput& out = getStrategyOutput(true);
+      const float tacticalDelta = out.tacticalThreat[0] - out.tacticalThreat[1];
+      const float kingDelta = out.kingSafety[0] - out.kingSafety[1];
+      const float mobilityDelta = out.mobility[0] - out.mobility[1];
       score += out.valueCp / 32;
+      score += static_cast<int>((tacticalDelta + kingDelta) * 12.0f);
+      score += static_cast<int>(mobilityDelta * 8.0f);
+      score -= strategicAsymmetricPrunePenalty(out, depth);
     }
     return std::clamp(score, alpha, beta);
   }
@@ -181,7 +247,102 @@ class Searcher {
       movegen::Move dummy;
       standPat += see_->estimate(dummy);
     }
+
+    if (strategyNet_ && strategyNet_->enabled) {
+      const auto& out = getStrategyOutput(false);
+      const float tacticalPressure = (out.tacticalThreat[0] + out.tacticalThreat[1]);
+      if (tacticalPressure < 0.05f) {
+        beta -= 2;  // soft quiescence pruning when no tactical pressure is predicted
+      }
+    }
+
     return std::clamp(standPat, alpha, beta);
+  }
+
+
+
+  engine_components::eval_model::GamePhase detectGamePhase() const {
+    int nonPawnMaterial = 0;
+    for (char piece : boardSnapshot_.squares) {
+      const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(piece)));
+      if (p == 'n' || p == 'b') nonPawnMaterial += 3;
+      if (p == 'r') nonPawnMaterial += 5;
+      if (p == 'q') nonPawnMaterial += 9;
+    }
+    if (nonPawnMaterial >= 36) return engine_components::eval_model::GamePhase::Opening;
+    if (nonPawnMaterial >= 16) return engine_components::eval_model::GamePhase::Middlegame;
+    return engine_components::eval_model::GamePhase::Endgame;
+  }
+
+  engine_components::eval_model::StrategyOutput evaluateStrategyNet() const {
+    std::vector<float> planes(static_cast<std::size_t>(strategyNet_->cfg.planes), 0.0f);
+    for (int sq = 0; sq < 64; ++sq) {
+      const char piece = boardSnapshot_.squares[static_cast<std::size_t>(sq)];
+      if (piece == '.') continue;
+      int idx = std::min(strategyNet_->cfg.planes - 1, std::tolower(static_cast<unsigned char>(piece)) - 'a');
+      if (idx >= 0 && idx < strategyNet_->cfg.planes) planes[static_cast<std::size_t>(idx)] += 1.0f / 8.0f;
+    }
+    return strategyNet_->evaluate(planes, detectGamePhase());
+  }
+
+  const engine_components::eval_model::StrategyOutput& getStrategyOutput(bool refresh) const {
+    if (!strategyNet_ || !strategyNet_->enabled) return cachedStrategy_;
+    if (!strategyCached_ || refresh) {
+      cachedStrategy_ = evaluateStrategyNet();
+      strategyCached_ = true;
+    }
+    return cachedStrategy_;
+  }
+
+  int moveOrderingBias(const movegen::Move& m, int ply) const {
+    int bias = 0;
+    if (history_) bias += history_->score[m.from][m.to] * 4;
+    if (killer_ && ply < static_cast<int>(killer_->killer.size())) {
+      const auto& k0 = killer_->killer[ply][0];
+      const auto& k1 = killer_->killer[ply][1];
+      if (k0.from == m.from && k0.to == m.to && k0.promotion == m.promotion) bias += 120;
+      if (k1.from == m.from && k1.to == m.to && k1.promotion == m.promotion) bias += 90;
+    }
+    if (pvTable_ && ply < static_cast<int>(pvTable_->length.size()) && pvTable_->length[ply] > 0) {
+      const auto& pv = pvTable_->pv[ply][0];
+      if (pv.from == m.from && pv.to == m.to && pv.promotion == m.promotion) {
+      bias += 150;
+      }
+    }
+    if (policy_ && policy_->enabled && !policy_->priors.empty()) {
+      const std::size_t hintIndex = static_cast<std::size_t>((m.to + m.from) % static_cast<int>(policy_->priors.size()));
+      bias += static_cast<int>(policy_->priors[hintIndex] * 100.0f);
+    }
+    if (strategyNet_ && strategyNet_->enabled) {
+      const auto& out = getStrategyOutput(false);
+      const std::size_t to = static_cast<std::size_t>(m.to % static_cast<int>(out.policy.size()));
+      if (!out.policy.empty()) bias += static_cast<int>(out.policy[to] * 20.0f);
+      bias += static_cast<int>((out.tacticalThreat[0] - out.tacticalThreat[1]) * 20.0f);
+    }
+    return bias;
+  }
+
+
+
+  int strategicAsymmetricPrunePenalty(const engine_components::eval_model::StrategyOutput& out, int depth) const {
+    const float closedness = std::clamp((out.kingSafety[0] + out.kingSafety[1]) - (out.tacticalThreat[0] + out.tacticalThreat[1]), -2.0f, 2.0f);
+    if (closedness <= 0.1f) return 0;
+    return static_cast<int>(closedness * depth * 3.0f);
+  }
+
+  int evaluateMoveLazy(const movegen::Move& move, int depth, bool useMaster) const {
+    int score = moveOrderingBias(move, depth);
+    score += static_cast<int>(__builtin_popcountll(temporal_.velocityMask()) / 8);
+    if (nnue_ && nnue_->enabled) {
+      if (useMaster) score += nnue_->evaluateFromAccumulator(nnueAccumulator_) / 24;
+      else score += nnue_->evaluateDraft(nnueAccumulator_.features) / 24;
+    }
+    if (strategyNet_ && strategyNet_->enabled && useMaster) {
+      const auto& out = getStrategyOutput(false);
+      const float wdlEdge = out.wdl[0] - out.wdl[2];
+      score += static_cast<int>(wdlEdge * 40.0f);
+    }
+    return score;
   }
 
   void updateHeuristics(int ply, const movegen::Move& best) {

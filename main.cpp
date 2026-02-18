@@ -1,4 +1,7 @@
+#include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <numeric>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -52,6 +55,7 @@ struct State {
   engine_components::timing::Manager timeManager;
   engine_components::tooling::Formats formats;
   engine_components::tooling::Integrity integrity;
+  engine_components::tooling::RamTablebase ramTablebase;
   engine_components::tooling::TestHarness tests;
 };
 
@@ -82,14 +86,40 @@ void initialize(State& state) {
   state.zobrist.initialize();
   state.repetition.clear();
   state.perftNodes = 0;
+
+  int pieceCount = 0;
+  int whiteNonKing = 0;
+  int blackNonKing = 0;
+  for (char piece : state.board.squares) {
+    if (piece == '.') continue;
+    ++pieceCount;
+    const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(piece)));
+    if (p == 'k') continue;
+    if (std::isupper(static_cast<unsigned char>(piece))) ++whiteNonKing;
+    else ++blackNonKing;
+  }
+  if (pieceCount <= 6) {
+    const std::string tbKey = "K" + std::to_string(whiteNonKing) + "v" + std::to_string(blackNonKing);
+    const int tbWdl = state.ramTablebase.probe(tbKey);
+    if (tbWdl != 0) {
+      std::cout << "info string ram_tablebase hit key=" << tbKey << " wdl=" << tbWdl << '\n';
+    }
+  }
+
   state.stopRequested = false;
   state.features.multiPV = 1;
   state.parallel.threads = 1;
   state.mcts.enabled = false;
   state.policy.enabled = true;
+  state.features.usePolicyPruning = true;
+  state.features.policyTopK = state.strategyNet.cfg.topKForPruning;
+  state.features.policyPruneThreshold = state.strategyNet.cfg.pruneThreshold;
+  state.features.useLazyEval = true;
+  state.features.masterEvalTopMoves = 3;
   state.nnue.load("nnue.bin");
   state.strategyNet.load("strategy_large.nn");
   state.policy.priors = {0.70f, 0.20f, 0.10f};
+  state.ramTablebase.enabled = false;
   state.cache.load(state.openingCachePath);
   state.logFile.open("engine.log", std::ios::app);
   log(state, "engine initialized with search/eval/tooling scaffolding");
@@ -106,8 +136,17 @@ void printUciId() {
   std::cout << "option name UseNNUE type check default true\n";
   std::cout << "option name UseMCTS type check default false\n";
   std::cout << "option name UseStrategyNN type check default true\n";
-  std::cout << "option name StrategyPolicyOutputs type spin default 64 min 16 max 4096\n";
+  std::cout << "option name StrategyPolicyOutputs type spin default 4096 min 64 max 4096\n";
   std::cout << "option name UseMultiRateThinking type check default true\n";
+  std::cout << "option name EnableDistillation type check default false\n";
+  std::cout << "option name UsePolicyPruning type check default true\n";
+  std::cout << "option name PolicyTopK type spin default 5 min 1 max 32\n";
+  std::cout << "option name UseLazyEval type check default true\n";
+  std::cout << "option name MasterEvalTopMoves type spin default 3 min 1 max 8\n";
+  std::cout << "option name UseAMXNNUEPath type check default false\n";
+  std::cout << "option name StrategyUseHardPhaseSwitch type check default true\n";
+  std::cout << "option name StrategyActiveExperts type spin default 2 min 1 max 2\n";
+  std::cout << "option name UseRamTablebase type check default false\n";
   std::cout << "option name AntiCheat type check default false\n";
   std::cout << "uciok\n";
 }
@@ -146,10 +185,29 @@ void handleSetOption(State& state, const std::string& cmd) {
   } else if (name == "UseStrategyNN") {
     state.strategyNet.enabled = (value == "true");
   } else if (name == "StrategyPolicyOutputs") {
-    state.strategyNet.cfg.policyOutputs = std::max(16, std::stoi(value));
+    state.strategyNet.cfg.policyOutputs = std::max(64, std::stoi(value));
     state.strategyNet.load(state.strategyNet.weightsPath);
   } else if (name == "UseMultiRateThinking") {
     state.features.useMultiRateThinking = (value == "true");
+  } else if (name == "EnableDistillation") {
+    state.training.distillationEnabled = (value == "true");
+  } else if (name == "UsePolicyPruning") {
+    state.features.usePolicyPruning = (value == "true");
+  } else if (name == "PolicyTopK") {
+    state.features.policyTopK = std::max(1, std::stoi(value));
+  } else if (name == "UseLazyEval") {
+    state.features.useLazyEval = (value == "true");
+  } else if (name == "MasterEvalTopMoves") {
+    state.features.masterEvalTopMoves = std::clamp(std::stoi(value), 1, 8);
+  } else if (name == "UseAMXNNUEPath") {
+    state.nnue.cfg.useAMXPath = (value == "true");
+  } else if (name == "StrategyUseHardPhaseSwitch") {
+    state.strategyNet.cfg.useHardPhaseSwitch = (value == "true");
+  } else if (name == "StrategyActiveExperts") {
+    state.strategyNet.cfg.activeExperts = std::clamp(std::stoi(value), 1, 2);
+  } else if (name == "UseRamTablebase") {
+    state.ramTablebase.enabled = (value == "true");
+    if (state.ramTablebase.enabled && !state.ramTablebase.loaded) state.ramTablebase.preload6ManMock();
   } else if (name == "AntiCheat") {
     state.integrity.antiCheatEnabled = (value == "true");
   }
@@ -295,8 +353,32 @@ void runLoop(State& state) {
     } else if (input == "losslearn") {
       state.training.lossLearning.recordLoss();
       state.training.lossLearning.runAdversarialSweep();
+      if (state.training.distillationEnabled && state.strategyNet.enabled) {
+        std::vector<float> planes(static_cast<std::size_t>(state.strategyNet.cfg.planes), 0.0f);
+        for (int sq = 0; sq < 64; ++sq) {
+          const char piece = state.board.squares[static_cast<std::size_t>(sq)];
+          if (piece == '.') continue;
+          const int idx = std::min(state.strategyNet.cfg.planes - 1, std::tolower(static_cast<unsigned char>(piece)) - 'a');
+          if (idx >= 0 && idx < state.strategyNet.cfg.planes) planes[static_cast<std::size_t>(idx)] += 1.0f / 8.0f;
+        }
+        int nonPawnMaterial = 0;
+        for (char piece : state.board.squares) {
+          const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(piece)));
+          if (p == 'n' || p == 'b') nonPawnMaterial += 3;
+          if (p == 'r') nonPawnMaterial += 5;
+          if (p == 'q') nonPawnMaterial += 9;
+        }
+        const auto phase = nonPawnMaterial >= 36 ? engine_components::eval_model::GamePhase::Opening
+                         : nonPawnMaterial >= 16 ? engine_components::eval_model::GamePhase::Middlegame
+                                                 : engine_components::eval_model::GamePhase::Endgame;
+        const auto strategy = state.strategyNet.evaluate(planes, phase);
+        const float policySignal = strategy.policy.empty() ? 0.0f
+            : std::accumulate(strategy.policy.begin(), strategy.policy.end(), 0.0f) / static_cast<float>(strategy.policy.size());
+        state.nnue.distillStrategicHint(policySignal, static_cast<float>(strategy.valueCp) / 1000.0f);
+      }
       std::cout << "info string loss_learning cases=" << state.training.lossLearning.lossCases
-                << " adversarial=" << state.training.lossLearning.adversarialTests << '\n';
+                << " adversarial=" << state.training.lossLearning.adversarialTests
+                << " distill=" << (state.training.distillationEnabled ? "on" : "off") << '\n';
     } else if (input == "integrity") {
       std::cout << "info string integrity " << (state.integrity.verifyRuntime() ? "ok" : "failed") << '\n';
     } else if (input == "explain") {
