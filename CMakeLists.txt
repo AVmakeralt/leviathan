@@ -7,11 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(chess_engine
   main.cpp
-  board.cpp
-  movegen.cpp
-  search.cpp
   eval.cpp
-  tt.cpp
 )
 
 target_compile_options(chess_engine PRIVATE -Wall -Wextra -pedantic)

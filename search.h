@@ -2,7 +2,9 @@
 #define SEARCH_H
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cctype>
 #include <random>
 #include <thread>
 #include <vector>
@@ -39,7 +41,9 @@ class Searcher {
            engine_components::search_helpers::PVTable* pvTable,
            engine_components::search_helpers::SEE* see,
            engine_components::eval_model::Handcrafted* handcrafted,
-           const engine_components::eval_model::PolicyNet* policy)
+           const engine_components::eval_model::PolicyNet* policy,
+           const engine_components::eval_model::NNUE* nnue,
+           const engine_components::eval_model::StrategyNet* strategyNet)
       : features_(features),
         killer_(killer),
         history_(history),
@@ -47,10 +51,13 @@ class Searcher {
         pvTable_(pvTable),
         see_(see),
         handcrafted_(handcrafted),
-        policy_(policy) {}
+        policy_(policy),
+        nnue_(nnue),
+        strategyNet_(strategyNet) {}
 
   Result think(const board::Board& b, const Limits& limits, std::mt19937& rng, bool* stopFlag) {
     Result out;
+    boardSnapshot_ = b;
     const auto moves = movegen::generatePseudoLegal(b);
     out.nodes = static_cast<long long>(moves.size()) * 128;
     out.depth = std::max(1, limits.depth);
@@ -69,6 +76,12 @@ class Searcher {
     if (handcrafted_) {
       out.evalBreakdown = handcrafted_->breakdown();
     }
+    if (nnue_ && nnue_->enabled) {
+      out.evalBreakdown += " nnue=on(" + std::to_string(nnue_->parameterCount()) + ")";
+    }
+    if (strategyNet_ && strategyNet_->enabled) {
+      out.evalBreakdown += " strategy_nn=on(" + std::to_string(strategyNet_->parameterCount()) + ")";
+    }
     return out;
   }
 
@@ -81,6 +94,9 @@ class Searcher {
   engine_components::search_helpers::SEE* see_;
   engine_components::eval_model::Handcrafted* handcrafted_;
   const engine_components::eval_model::PolicyNet* policy_;
+  const engine_components::eval_model::NNUE* nnue_;
+  const engine_components::eval_model::StrategyNet* strategyNet_;
+  board::Board boardSnapshot_{};
 
   void assignCandidateDepths(Result& out, int candidateCount, int rootDepth) const {
     out.candidateDepths.assign(candidateCount, rootDepth);
@@ -139,6 +155,23 @@ class Searcher {
     if (features_.useMateDistancePruning) score += 1;
     if (features_.useExtensions) score += 1;
     if (handcrafted_) score += handcrafted_->score() / 100;
+    if (nnue_ && nnue_->enabled) {
+      const std::vector<float> features = engine_components::eval_model::NNUE::extractFeatures(
+          boardSnapshot_.squares, boardSnapshot_.whiteToMove, nnue_->cfg.inputs);
+      score += nnue_->evaluate(features) / 16;
+    }
+    if (strategyNet_ && strategyNet_->enabled) {
+      std::vector<float> planes(static_cast<std::size_t>(strategyNet_->cfg.planes), 0.0f);
+      for (int sq = 0; sq < 64; ++sq) {
+        char piece = boardSnapshot_.squares[static_cast<std::size_t>(sq)];
+        if (piece != '.') {
+          int idx = std::min(strategyNet_->cfg.planes - 1, std::tolower(static_cast<unsigned char>(piece)) - 'a');
+          if (idx >= 0 && idx < strategyNet_->cfg.planes) planes[static_cast<std::size_t>(idx)] += 1.0f / 8.0f;
+        }
+      }
+      const engine_components::eval_model::StrategyOutput out = strategyNet_->evaluate(planes);
+      score += out.valueCp / 32;
+    }
     return std::clamp(score, alpha, beta);
   }
 
