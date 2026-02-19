@@ -65,9 +65,58 @@ void log(State& state, const std::string& msg) {
   }
 }
 
+std::string describeFeatures(const State& state) {
+  std::ostringstream out;
+  out << "search[pvs=" << state.features.usePVS << " aspiration=" << state.features.useAspiration
+      << " null=" << state.features.useNullMove << " lmr=" << state.features.useLMR
+      << " qsearch=" << state.features.useQuiescence << " mcts=" << state.features.useMCTS
+      << " policyPrune=" << state.features.usePolicyPruning
+      << " pvPrune=" << state.features.usePolicyValuePruning
+      << " lazy=" << state.features.useLazyEval
+      << " topK=" << state.features.policyTopK
+      << " masterTop=" << state.features.masterEvalTopMoves << "] ";
+
+  out << "nnue[enabled=" << state.nnue.enabled << " amx=" << state.nnue.cfg.useAMXPath
+      << " inputs=" << state.nnue.cfg.inputs << " h1=" << state.nnue.cfg.hidden1
+      << " h2=" << state.nnue.cfg.hidden2 << "] ";
+
+  out << "strategy[enabled=" << state.strategyNet.enabled
+      << " policyOut=" << state.strategyNet.cfg.policyOutputs
+      << " hardPhase=" << state.strategyNet.cfg.useHardPhaseSwitch
+      << " experts=" << state.strategyNet.cfg.activeExperts << "] ";
+
+  out << "m2cts[batch=" << state.mcts.miniBatchSize
+      << " vloss=" << state.mcts.virtualLoss
+      << " phaseAware=" << state.mcts.usePhaseAwareM2CTS
+      << " clade=" << state.mcts.useCladeSelection
+      << " fpuRed=" << state.mcts.fpuReduction << "] ";
+
+  out << "parallel[on=" << state.features.useParallel
+      << " threads=" << state.parallel.threads
+      << " ybwc=" << state.parallel.ybwcFirstMoveSerial
+      << " splitDepth=" << state.parallel.splitDepthLimit
+      << " splitMoves=" << state.parallel.maxSplitMoves
+      << " deterministic=" << state.parallel.deterministicMode << "] ";
+
+  out << "tooling[ramTB=" << state.ramTablebase.enabled
+      << " ipcPath=" << state.tests.ipc.path
+      << " binpack=" << state.tests.binpack.path
+      << " cat=" << state.training.cat.enabled << "]";
+
+  return out.str();
+}
+
 std::string openingKey(const State& state) {
   if (state.board.history.empty()) {
-    return "startpos";
+    board::Board start;
+    start.setStartPos();
+    if (state.board.whiteToMove == start.whiteToMove && state.board.squares == start.squares) {
+      return "startpos";
+    }
+    std::ostringstream oss;
+    oss << (state.board.whiteToMove ? 'w' : 'b') << ':';
+    for (char sq : state.board.squares) oss << sq;
+    return oss.str();
   }
   std::ostringstream oss;
   for (std::size_t i = 0; i < state.board.history.size(); ++i) {
@@ -132,9 +181,20 @@ void printUciId() {
   std::cout << "id author Codex\n";
   std::cout << "option name Hash type spin default 64 min 1 max 8192\n";
   std::cout << "option name Threads type spin default 1 min 1 max 256\n";
+  std::cout << "option name UseParallelSearch type check default false\n";
+  std::cout << "option name SplitDepthLimit type spin default 8 min 1 max 32\n";
+  std::cout << "option name YBWCFirstMoveSerial type check default true\n";
+  std::cout << "option name MaxSplitMoves type spin default 6 min 1 max 32\n";
+  std::cout << "option name DeterministicMode type check default false\n";
   std::cout << "option name MultiPV type spin default 1 min 1 max 32\n";
   std::cout << "option name UseNNUE type check default true\n";
   std::cout << "option name UseMCTS type check default false\n";
+  std::cout << "option name MCTSBatchSize type spin default 256 min 32 max 2048\n";
+  std::cout << "option name MCTSVirtualLoss type string default 0.25\n";
+  std::cout << "option name MCTSUsePhaseAware type check default true\n";
+  std::cout << "option name MCTSUseCladeSelection type check default true\n";
+  std::cout << "option name MCTSFpuReduction type string default 0.20\n";
+  std::cout << "option name EnableCAT type check default true\n";
   std::cout << "option name UseStrategyNN type check default true\n";
   std::cout << "option name StrategyPolicyOutputs type spin default 4096 min 64 max 4096\n";
   std::cout << "option name UseMultiRateThinking type check default true\n";
@@ -175,6 +235,16 @@ void handleSetOption(State& state, const std::string& cmd) {
     state.tt.initialize(static_cast<std::size_t>(mb));
   } else if (name == "Threads") {
     state.parallel.threads = std::max(1, std::stoi(value));
+  } else if (name == "UseParallelSearch") {
+    state.features.useParallel = (value == "true");
+  } else if (name == "SplitDepthLimit") {
+    state.parallel.splitDepthLimit = std::clamp(std::stoi(value), 1, 32);
+  } else if (name == "YBWCFirstMoveSerial") {
+    state.parallel.ybwcFirstMoveSerial = (value == "true");
+  } else if (name == "MaxSplitMoves") {
+    state.parallel.maxSplitMoves = std::clamp(std::stoi(value), 1, 32);
+  } else if (name == "DeterministicMode") {
+    state.parallel.deterministicMode = (value == "true");
   } else if (name == "MultiPV") {
     state.features.multiPV = std::max(1, std::stoi(value));
   } else if (name == "UseNNUE") {
@@ -182,8 +252,22 @@ void handleSetOption(State& state, const std::string& cmd) {
   } else if (name == "UseMCTS") {
     state.mcts.enabled = (value == "true");
     state.features.useMCTS = state.mcts.enabled;
+  } else if (name == "MCTSBatchSize") {
+    state.mcts.miniBatchSize = std::clamp(std::stoi(value), 32, 2048);
+  } else if (name == "MCTSVirtualLoss") {
+    state.mcts.virtualLoss = std::clamp(std::stof(value), 0.0f, 2.0f);
+  } else if (name == "MCTSUsePhaseAware") {
+    state.mcts.usePhaseAwareM2CTS = (value == "true");
+  } else if (name == "MCTSUseCladeSelection") {
+    state.mcts.useCladeSelection = (value == "true");
+  } else if (name == "MCTSFpuReduction") {
+    state.mcts.fpuReduction = std::clamp(std::stof(value), 0.0f, 1.0f);
+  } else if (name == "EnableCAT") {
+    state.training.cat.enabled = (value == "true");
   } else if (name == "UseStrategyNN") {
     state.strategyNet.enabled = (value == "true");
+  } else if (name == "UseBook") {
+    state.book.enabled = (value == "true");
   } else if (name == "StrategyPolicyOutputs") {
     state.strategyNet.cfg.policyOutputs = std::max(64, std::stoi(value));
     state.strategyNet.load(state.strategyNet.weightsPath);
@@ -278,6 +362,10 @@ search::Limits parseGoLimits(State& state, const std::string& cmd) {
   if (limits.movetimeMs == 0 && state.timeManager.remainingMs > 0) {
     limits.movetimeMs = state.timeManager.allocateMoveTimeMs(25);
   }
+  if (state.features.useParallel && state.parallel.threads > 1) {
+    const int overhead = std::max(1, state.parallel.threads / 2);
+    limits.movetimeMs = std::max(1, limits.movetimeMs - overhead);
+  }
   return limits;
 }
 
@@ -289,6 +377,12 @@ void handleGo(State& state, const std::string& cmd) {
   }
 
   const std::string key = openingKey(state);
+  const std::string bookMove = state.book.probe(key);
+  if (!bookMove.empty()) {
+    std::cout << "info string book_hit true\n";
+    std::cout << "bestmove " << bookMove << "\n";
+    return;
+  }
   const std::string cached = state.cache.get(key);
   if (!cached.empty()) {
     std::cout << "info string cache_hit true\n";
@@ -296,11 +390,30 @@ void handleGo(State& state, const std::string& cmd) {
     return;
   }
 
+  int pieceCount = 0;
+  int whiteNonKing = 0;
+  int blackNonKing = 0;
+  for (char piece : state.board.squares) {
+    if (piece == '.') continue;
+    ++pieceCount;
+    const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(piece)));
+    if (p == 'k') continue;
+    if (std::isupper(static_cast<unsigned char>(piece))) ++whiteNonKing;
+    else ++blackNonKing;
+  }
+  if (pieceCount <= 6) {
+    const std::string tbKey = "K" + std::to_string(whiteNonKing) + "v" + std::to_string(blackNonKing);
+    const int tbWdl = state.ramTablebase.probe(tbKey);
+    if (tbWdl != 0) {
+      std::cout << "info string ram_tablebase hit key=" << tbKey << " wdl=" << tbWdl << '\n';
+    }
+  }
+
   state.stopRequested = false;
   const search::Limits limits = parseGoLimits(state, cmd);
 
   search::Searcher searcher(state.features, &state.killer, &state.history, &state.counter, &state.pvTable, &state.see,
-                            &state.handcrafted, &state.policy, &state.nnue, &state.strategyNet);
+                            &state.handcrafted, &state.policy, &state.nnue, &state.strategyNet, state.mcts, state.parallel, &state.tt);
   const search::Result result = searcher.think(state.board, limits, state.rng, &state.stopRequested);
 
   bool novel = state.prep.novelty.isNovel(key);
@@ -344,12 +457,41 @@ void runLoop(State& state) {
     } else if (input == "stop") {
       state.stopRequested = true;
     } else if (input == "perft") {
-      state.perftNodes += movegen::generatePseudoLegal(state.board).size();
+      state.perftNodes += movegen::generateLegal(state.board).size();
       std::cout << "info string perft_nodes " << state.perftNodes << '\n';
     } else if (input == "bench") {
-      std::cout << "info string bench placeholders: search, nnue, mcts, movegen, tt\n";
+      const auto pseudo = movegen::generatePseudoLegal(state.board).size();
+      const auto legal = movegen::generateLegal(state.board).size();
+      std::cout << "info string bench movegen_pseudo=" << pseudo
+                << " movegen_legal=" << legal
+                << " nnue_params=" << state.nnue.parameterCount()
+                << " strategy_params=" << state.strategyNet.parameterCount()
+                << " tt_entries=" << state.tt.entries.size()
+                << " mcts_batch=" << state.mcts.miniBatchSize << "\n";
     } else if (input == "buildbook") {
-      std::cout << "info string book_lines " << state.prep.builder.lines.size() << '\n';
+      int imported = 0;
+      for (const auto& kv : state.prep.builder.lines) {
+        if (kv.first.empty() || kv.second.empty()) continue;
+        state.book.moveByKey[kv.first] = kv.second;
+        ++imported;
+      }
+      if (imported > 0) state.book.enabled = true;
+      std::cout << "info string book_lines " << state.prep.builder.lines.size()
+                << " imported=" << imported
+                << " entries=" << state.book.moveByKey.size()
+                << " enabled=" << (state.book.enabled ? "true" : "false") << '\n';
+    } else if (input == "ipcmetrics") {
+      engine_components::tooling::TrainingMetrics m;
+      m.currentLoss = static_cast<float>(state.training.lossLearning.lossCases);
+      m.eloGain = static_cast<float>(state.training.lossLearning.adversarialTests) * 0.1f;
+      m.nodesPerSecond = 1000000;
+      const std::string msg = "training-active";
+      std::memcpy(m.statusMsg.data(), msg.c_str(), std::min(msg.size(), m.statusMsg.size() - 1));
+      const bool ok = state.tests.ipc.write(m);
+      std::cout << "info string ipc_metrics " << (ok ? "written" : "write_failed") << '\n';
+    } else if (input == "binpackstats") {
+      const std::size_t positions = state.tests.binpack.estimatePositionThroughput();
+      std::cout << "info string binpack_positions_est " << positions << '\n';
     } else if (input == "losslearn") {
       state.training.lossLearning.recordLoss();
       state.training.lossLearning.runAdversarialSweep();
@@ -383,6 +525,8 @@ void runLoop(State& state) {
       std::cout << "info string integrity " << (state.integrity.verifyRuntime() ? "ok" : "failed") << '\n';
     } else if (input == "explain") {
       std::cout << "info string explain " << state.handcrafted.breakdown() << '\n';
+    } else if (input == "features") {
+      std::cout << "info string features " << describeFeatures(state) << '\n';
     } else if (input == "quit") {
       state.running = false;
     } else if (!input.empty()) {

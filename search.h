@@ -15,6 +15,7 @@
 #include "board.h"
 #include "engine_components.h"
 #include "movegen.h"
+#include "tt.h"
 
 namespace search {
 
@@ -46,7 +47,10 @@ class Searcher {
            engine_components::eval_model::Handcrafted* handcrafted,
            const engine_components::eval_model::PolicyNet* policy,
            const engine_components::eval_model::NNUE* nnue,
-           const engine_components::eval_model::StrategyNet* strategyNet)
+           const engine_components::eval_model::StrategyNet* strategyNet,
+           engine_components::search_arch::MCTSConfig mctsCfg,
+           engine_components::search_arch::ParallelConfig parallelCfg,
+           tt::Table* tt)
       : features_(features),
         killer_(killer),
         history_(history),
@@ -56,7 +60,10 @@ class Searcher {
         handcrafted_(handcrafted),
         policy_(policy),
         nnue_(nnue),
-        strategyNet_(strategyNet) {}
+        strategyNet_(strategyNet),
+        mctsCfg_(mctsCfg),
+        parallelCfg_(parallelCfg),
+        tt_(tt) {}
 
   Result think(const board::Board& b, const Limits& limits, std::mt19937& rng, bool* stopFlag) {
     Result out;
@@ -95,6 +102,9 @@ class Searcher {
     if (strategyNet_ && strategyNet_->enabled) {
       out.evalBreakdown += " strategy_nn=on(" + std::to_string(strategyNet_->parameterCount()) + ")";
     }
+    out.evalBreakdown += " tt_hits=" + std::to_string(ttHits_) + " tt_stores=" + std::to_string(ttStores_);
+    out.evalBreakdown += " ab_violations=" + std::to_string(alphaBetaViolations_);
+    out.evalBreakdown += " horizon_osc=" + std::to_string(horizonOscillations_);
     return out;
   }
 
@@ -109,6 +119,13 @@ class Searcher {
   const engine_components::eval_model::PolicyNet* policy_;
   const engine_components::eval_model::NNUE* nnue_;
   const engine_components::eval_model::StrategyNet* strategyNet_;
+  engine_components::search_arch::MCTSConfig mctsCfg_{};
+  engine_components::search_arch::ParallelConfig parallelCfg_{};
+  tt::Table* tt_ = nullptr;
+  int alphaBetaViolations_ = 0;
+  int ttHits_ = 0;
+  int ttStores_ = 0;
+  int horizonOscillations_ = 0;
   board::Board boardSnapshot_{};
   std::size_t nodeCounter_ = 0;
   int strategyCadence_ = 8;
@@ -131,12 +148,66 @@ class Searcher {
     }
   }
 
+  static bool isInsufficientMaterial(const board::Board& b) {
+    int nonKings = 0;
+    int minor = 0;
+    for (char piece : b.squares) {
+      const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(piece)));
+      if (p == '.' || p == 'k') continue;
+      ++nonKings;
+      if (p == 'b' || p == 'n') ++minor;
+    }
+    return nonKings == 0 || (nonKings == 1 && minor == 1);
+  }
+
+  static std::uint64_t positionKey(const board::Board& b) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (char sq : b.squares) {
+      h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(sq));
+      h *= 1099511628211ULL;
+    }
+    h ^= static_cast<std::uint64_t>(b.whiteToMove);
+    return h;
+  }
+
+  static bool isLikelyRepetition(const board::Board& b) {
+    if (b.history.size() < 8) return false;
+    const std::size_t n = b.history.size();
+    return b.history[n - 1] == b.history[n - 5] && b.history[n - 2] == b.history[n - 6] &&
+           b.history[n - 3] == b.history[n - 7] && b.history[n - 4] == b.history[n - 8];
+  }
+
+  int cladeId(const movegen::Move& m) const {
+    const int df = std::abs((m.to % 8) - (m.from % 8));
+    const int dr = std::abs((m.to / 8) - (m.from / 8));
+    if (dr <= 1 && df <= 1) return 0;             // local maneuver/king safety
+    if (dr >= 2 && df <= 1) return 1;             // central / vertical pressure
+    if (df >= 2 && dr <= 1) return 2;             // flank/side-shift
+    return 3;                                     // tactical/diagonal jumps
+  }
+
+  float m2ctsPhaseMixScore(int depth) const {
+    if (!(features_.useMCTS && mctsCfg_.usePhaseAwareM2CTS && strategyNet_ && strategyNet_->enabled)) return 0.0f;
+    const auto& out = getStrategyOutput(false);
+    const float opening = out.expertMix[0];
+    const float middle = out.expertMix[1];
+    const float ending = out.expertMix[2];
+    const float phaseBias = depth >= 10 ? opening : depth >= 5 ? middle : ending;
+    return phaseBias * 60.0f;
+  }
+
+  int applyVirtualLossPenalty(int orderingScore, int batchSlot) const {
+    if (!(features_.useMCTS && mctsCfg_.virtualLoss > 0.0f)) return orderingScore;
+    const float virtualLoss = static_cast<float>(batchSlot) * mctsCfg_.virtualLoss * 20.0f;
+    return orderingScore - static_cast<int>(virtualLoss);
+  }
+
   void iterativeDeepening(Result& out, const std::vector<movegen::Move>& moves, const Limits& limits, std::mt19937& rng,
                           bool* stopFlag) {
     std::uniform_int_distribution<std::size_t> d(0, moves.size() - 1);
     int alpha = -30000;
     int beta = 30000;
-    out.bestMove = moves[d(rng)];
+    out.bestMove = parallelCfg_.deterministicMode ? moves.front() : moves[d(rng)];
 
     for (int depth = 1; depth <= out.depth; ++depth) {
       if (stopFlag && *stopFlag) break;
@@ -198,6 +269,13 @@ class Searcher {
       }
       out.nodes += depth * 1000;
 
+      if (out.bestMove.from == lastBestMove_.from && out.bestMove.to == lastBestMove_.to &&
+          out.bestMove.promotion == lastBestMove_.promotion) {
+        out.scoreCp += 6;  // PV anchoring bonus when best line remains stable
+      }
+      lastBestMove_ = out.bestMove;
+      lastIterationScore_ = out.scoreCp;
+
       updateHeuristics(depth, out.bestMove);
 
       if (limits.infinite) {
@@ -207,6 +285,10 @@ class Searcher {
   }
 
   int alphaBeta(int depth, int alpha, int beta) {
+    if (alpha > beta) {
+      ++alphaBetaViolations_;
+      std::swap(alpha, beta);
+    }
     if (depth <= 0) {
       return features_.useQuiescence ? quiescence(alpha, beta) : 0;
     }
@@ -238,14 +320,60 @@ class Searcher {
       score += static_cast<int>(mobilityDelta * 8.0f);
       score -= strategicAsymmetricPrunePenalty(out, depth);
     }
-    return std::clamp(score, alpha, beta);
+    int bounded = std::clamp(score, alpha, beta);
+    if (tt_) {
+      tt::Bound bnd = tt::Bound::Exact;
+      if (bounded <= alphaOrig) bnd = tt::Bound::Upper;
+      else if (bounded >= betaOrig) bnd = tt::Bound::Lower;
+      tt_->store(key, depth, bounded, bnd);
+      ++ttStores_;
+    }
+    return bounded;
   }
 
   int quiescence(int alpha, int beta) const {
     int standPat = 0;
     if (see_) {
       movegen::Move dummy;
-      standPat += see_->estimate(dummy);
+      standPat += see_->estimate(dummy, &boardSnapshot_.squares);
+    }
+
+    if (nnue_ && nnue_->enabled && !nnueAccumulator_.features.empty()) {
+      standPat += nnue_->evaluateMiniQSearch(nnueAccumulator_.features) / 32;
+    }
+
+    const int originalStandPat = standPat;
+    if (standPat >= beta) return beta;
+    alpha = std::max(alpha, standPat);
+
+    int best = standPat;
+    const int deltaMargin = 96;
+    const auto legalMoves = movegen::generateLegal(boardSnapshot_);
+    for (const auto& mv : legalMoves) {
+      const bool isCapture = boardSnapshot_.squares[static_cast<std::size_t>(mv.to)] != '.';
+      const bool isPromotion = mv.promotion != '\0';
+      const int seeScore = see_ ? see_->estimate(mv, &boardSnapshot_.squares) : 0;
+      const bool quietCheckLike = !isCapture && !isPromotion && (mv.to % 8 == 4 || mv.to / 8 == 4);
+      if (!isCapture && !isPromotion && !quietCheckLike) continue;
+      if (isCapture && seeScore < -80 && !isPromotion) continue;
+      if (standPat + seeScore + deltaMargin < alpha && !quietCheckLike && !isPromotion) continue;
+
+      int tactical = evaluateMoveLazy(mv, 0, false) / 4 + seeScore / 2;
+      best = std::max(best, standPat + tactical);
+      alpha = std::max(alpha, best);
+      if (alpha >= beta) return beta;
+    }
+
+    if (std::abs(best - originalStandPat) > 240) {
+      best = (best + originalStandPat) / 2;  // damp stand-pat instability spikes
+    }
+
+    if (strategyNet_ && strategyNet_->enabled) {
+      const auto& out = getStrategyOutput(false);
+      const float tacticalPressure = (out.tacticalThreat[0] + out.tacticalThreat[1]);
+      if (tacticalPressure < 0.05f) {
+        best = std::min(best, beta - 2);  // soft quiescence pruning
+      }
     }
 
     if (strategyNet_ && strategyNet_->enabled) {
@@ -351,7 +479,14 @@ class Searcher {
       killer_->killer[ply][0] = best;
     }
     if (history_) {
-      history_->score[best.from][best.to] += 1;
+      for (auto& row : history_->score) for (int& cell : row) cell = (cell * 31) / 32;
+      for (int from = 0; from < 64; ++from) {
+        for (int to = 0; to < 64; ++to) {
+          if (from == best.from && to == best.to) continue;
+          history_->score[from][to] -= std::clamp(history_->score[from][to] / 64, -1, 1);
+        }
+      }
+      history_->score[best.from][best.to] += 4;
     }
     if (counter_ && best.from >= 0 && best.from < 64 && best.to >= 0 && best.to < 64) {
       counter_->counter[best.from][best.to] = best;

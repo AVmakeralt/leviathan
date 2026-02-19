@@ -5,6 +5,12 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <cstring>
+#include <condition_variable>
+#include <atomic>
 #include <fstream>
 #include <future>
 #include <numeric>
@@ -95,7 +101,26 @@ struct PVTable {
 };
 
 struct SEE {
-  int estimate(const movegen::Move&) const { return 0; }
+  static int pieceValue(char p) {
+    switch (static_cast<char>(std::tolower(static_cast<unsigned char>(p)))) {
+      case 'p': return 100;
+      case 'n': return 320;
+      case 'b': return 330;
+      case 'r': return 500;
+      case 'q': return 900;
+      case 'k': return 20000;
+      default: return 0;
+    }
+  }
+
+  int estimate(const movegen::Move& m, const std::array<char, 64>* squares = nullptr) const {
+    if (!squares || m.from < 0 || m.to < 0 || m.from >= 64 || m.to >= 64) return 0;
+    const char from = (*squares)[static_cast<std::size_t>(m.from)];
+    const char to = (*squares)[static_cast<std::size_t>(m.to)];
+    int gain = pieceValue(to) - pieceValue(from) / 8;
+    if (m.promotion != '\0') gain += pieceValue(m.promotion) - 100;
+    return gain;
+  }
 };
 
 struct SearchResultCache {
@@ -785,6 +810,13 @@ struct PolicyNet {
   std::vector<float> priors;
 };
 
+struct CATConfig {
+  bool enabled = true;
+  int lowBudgetNodes = 2000;
+  int highBudgetNodes = 200000;
+  float disagreementThreshold = 80.0f;
+};
+
 struct LossLearning {
   int lossCases = 0;
   int adversarialTests = 0;
@@ -798,6 +830,7 @@ struct TrainingInfra {
   bool supervisedEnabled = false;
   bool distillationEnabled = false;
   std::string replayBufferPath = "replay.bin";
+  CATConfig cat;
   LossLearning lossLearning;
 };
 }  // namespace eval_model
@@ -831,11 +864,20 @@ struct ParallelConfig {
   bool treeSplit = false;
   bool hashSync = false;
   bool loadBalancing = false;
+  bool ybwcFirstMoveSerial = true;
+  int splitDepthLimit = 8;
+  int maxSplitMoves = 6;
+  bool deterministicMode = false;
 };
 
 struct MCTSConfig {
   bool enabled = false;
   int simulations = 0;
+  int miniBatchSize = 256;
+  float virtualLoss = 0.25f;
+  bool usePhaseAwareM2CTS = true;
+  bool useCladeSelection = true;
+  float fpuReduction = 0.20f;
 };
 }  // namespace search_arch
 
@@ -844,8 +886,20 @@ struct Book {
   bool enabled = false;
   std::string format = "polyglot";
   std::string path = "book.bin";
+  std::unordered_map<std::string, std::string> moveByKey;
 
-  std::string probe() const { return ""; }
+  void seedDefaults() {
+    if (!moveByKey.empty()) return;
+    moveByKey["startpos"] = "e2e4";
+    moveByKey["e2e4"] = "e7e5";
+    moveByKey["d2d4"] = "d7d5";
+  }
+
+  std::string probe(const std::string& key) const {
+    if (!enabled) return "";
+    auto it = moveByKey.find(key);
+    return it == moveByKey.end() ? "" : it->second;
+  }
 };
 
 struct Novelty {
@@ -919,6 +973,8 @@ struct TestHarness {
   bool eloEnabled = true;
   bool selfPlayTournaments = true;
   std::unordered_map<std::string, double> params;
+  SharedMetricsIPC ipc;
+  BinpackReader binpack;
 };
 }  // namespace tooling
 
