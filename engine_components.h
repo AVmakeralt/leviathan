@@ -196,6 +196,8 @@ struct NNUEConfig {
   bool useSCReLU = true;  // squared clipped ReLU in first hidden layer
   bool useAMXPath = false;
   int draftHidden1 = 512; // tiny fast path width for lazy evaluation
+  int miniQSearchHidden = 256;
+  float policyPruneFloor = 0.05f;
 };
 
 struct NNUE {
